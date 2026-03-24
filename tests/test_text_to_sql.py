@@ -15,8 +15,9 @@ from unittest.mock import patch, MagicMock
 # Make src/ importable without installing
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from text_to_sql import validate_sql, generate_sql, load_snowflake_context, build_system_prompt
-from mock_db import run_query, get_connection
+import sqlite3
+from text_to_sql import validate_sql, generate_sql, generate_sql_with_feedback, explain_sql, load_snowflake_context, build_system_prompt, MAX_RETRIES
+from mock_db import run_query, get_connection, explain_query
 
 
 # ---------------------------------------------------------------------------
@@ -299,3 +300,203 @@ class TestPromptInjectionGuardrail:
         """build_system_prompt must mention the <user_question> delimiter."""
         prompt = build_system_prompt("")
         assert "<user_question>" in prompt
+
+
+# ---------------------------------------------------------------------------
+# explain_query (mock_db)
+# ---------------------------------------------------------------------------
+
+class TestExplainQuery:
+    def test_valid_select_no_exception(self):
+        explain_query("SELECT * FROM customers")
+
+    def test_bad_table_raises(self):
+        with pytest.raises(sqlite3.OperationalError):
+            explain_query("SELECT * FROM nonexistent_table")
+
+    def test_syntax_error_raises(self):
+        with pytest.raises(sqlite3.OperationalError):
+            explain_query("SELECT FROM WHERE")
+
+    def test_returns_none(self):
+        result = explain_query("SELECT 1")
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# explain_sql (text_to_sql)
+# ---------------------------------------------------------------------------
+
+class TestExplainSql:
+    def test_returns_none_on_valid_sql(self):
+        assert explain_sql("SELECT * FROM customers") is None
+
+    def test_returns_error_string_on_bad_sql(self):
+        result = explain_sql("SELECT * FROM missing_table")
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_error_string_is_informative(self):
+        result = explain_sql("SELECT * FROM missing_table")
+        assert "no such table" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# generate_sql_with_feedback
+# ---------------------------------------------------------------------------
+
+class TestGenerateSqlWithFeedback:
+    SELECT_SQL = "SELECT * FROM customers LIMIT 5"
+
+    def _make_mock_response(self, text: str):
+        block = MagicMock()
+        block.type = "text"
+        block.text = text
+        response = MagicMock()
+        response.content = [block]
+        return response
+
+    def test_returns_sql_string(self):
+        with patch("text_to_sql.anthropic.Anthropic") as MockClient:
+            MockClient.return_value.messages.create.return_value = (
+                self._make_mock_response(self.SELECT_SQL)
+            )
+            result = generate_sql_with_feedback(
+                "list customers", "SELECT * FROM bad_table", "no such table: bad_table"
+            )
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_error_context_in_message(self):
+        with patch("text_to_sql.anthropic.Anthropic") as MockClient:
+            mock_create = MockClient.return_value.messages.create
+            mock_create.return_value = self._make_mock_response(self.SELECT_SQL)
+            generate_sql_with_feedback(
+                "list customers", "SELECT * FROM bad_table", "no such table: bad_table"
+            )
+            content = mock_create.call_args.kwargs["messages"][0]["content"]
+        assert "SELECT * FROM bad_table" in content
+        assert "no such table: bad_table" in content
+
+    def test_original_question_in_message(self):
+        with patch("text_to_sql.anthropic.Anthropic") as MockClient:
+            mock_create = MockClient.return_value.messages.create
+            mock_create.return_value = self._make_mock_response(self.SELECT_SQL)
+            generate_sql_with_feedback(
+                "list customers", "SELECT * FROM bad_table", "some error"
+            )
+            content = mock_create.call_args.kwargs["messages"][0]["content"]
+        assert "list customers" in content
+
+    def test_uses_user_question_tags(self):
+        with patch("text_to_sql.anthropic.Anthropic") as MockClient:
+            mock_create = MockClient.return_value.messages.create
+            mock_create.return_value = self._make_mock_response(self.SELECT_SQL)
+            generate_sql_with_feedback("q", "SELECT 1", "err")
+            content = mock_create.call_args.kwargs["messages"][0]["content"]
+        assert content.startswith("<user_question>")
+        assert content.endswith("</user_question>")
+
+
+# ---------------------------------------------------------------------------
+# Retry loop integration tests
+# ---------------------------------------------------------------------------
+
+class TestRetryLoop:
+    GOOD_SQL = "SELECT * FROM customers LIMIT 5"
+    BAD_SQL = "SELECT * FROM nonexistent_table"
+
+    def _make_mock_response(self, text: str):
+        block = MagicMock()
+        block.type = "text"
+        block.text = text
+        response = MagicMock()
+        response.content = [block]
+        return response
+
+    def test_explain_failure_triggers_retry(self, capsys):
+        responses = [
+            self._make_mock_response(self.BAD_SQL),
+            self._make_mock_response(self.GOOD_SQL),
+        ]
+        with (
+            patch("sys.argv", ["text_to_sql.py", "list customers"]),
+            patch.dict(os.environ, {"USE_MOCK_DB": "true"}),
+            patch("text_to_sql.anthropic.Anthropic") as MockClient,
+        ):
+            MockClient.return_value.messages.create.side_effect = responses
+            from text_to_sql import main
+            main()
+
+        assert MockClient.return_value.messages.create.call_count == 2
+
+    def test_retry_message_printed(self, capsys):
+        responses = [
+            self._make_mock_response(self.BAD_SQL),
+            self._make_mock_response(self.GOOD_SQL),
+        ]
+        with (
+            patch("sys.argv", ["text_to_sql.py", "list customers"]),
+            patch.dict(os.environ, {"USE_MOCK_DB": "true"}),
+            patch("text_to_sql.anthropic.Anthropic") as MockClient,
+        ):
+            MockClient.return_value.messages.create.side_effect = responses
+            from text_to_sql import main
+            main()
+
+        captured = capsys.readouterr()
+        assert "Retrying with error feedback" in captured.out
+
+    def test_run_query_failure_triggers_retry(self, capsys):
+        responses = [
+            self._make_mock_response(self.GOOD_SQL),
+            self._make_mock_response(self.GOOD_SQL),
+        ]
+        with (
+            patch("sys.argv", ["text_to_sql.py", "list customers"]),
+            patch.dict(os.environ, {"USE_MOCK_DB": "true"}),
+            patch("text_to_sql.anthropic.Anthropic") as MockClient,
+            patch("mock_db.run_query", side_effect=[Exception("runtime error"), [{"col": "val"}]]),
+        ):
+            MockClient.return_value.messages.create.side_effect = responses
+            from text_to_sql import main
+            main()
+
+        assert MockClient.return_value.messages.create.call_count == 2
+
+    def test_max_retries_exhausted_exits(self):
+        with (
+            patch("sys.argv", ["text_to_sql.py", "list customers"]),
+            patch.dict(os.environ, {"USE_MOCK_DB": "true"}),
+            patch("text_to_sql.anthropic.Anthropic") as MockClient,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            MockClient.return_value.messages.create.side_effect = [
+                self._make_mock_response(self.BAD_SQL),
+                self._make_mock_response(self.BAD_SQL),
+                self._make_mock_response(self.BAD_SQL),
+            ]
+            from text_to_sql import main
+            main()
+
+        assert exc_info.value.code == 1
+
+    def test_guardrail_does_not_retry(self):
+        guardrail = "ERROR: Only SELECT queries are permitted."
+        with (
+            patch("sys.argv", ["text_to_sql.py", "delete all records"]),
+            patch.dict(os.environ, {"USE_MOCK_DB": "true"}),
+            patch("text_to_sql.anthropic.Anthropic") as MockClient,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            MockClient.return_value.messages.create.return_value = (
+                self._make_mock_response(guardrail)
+            )
+            from text_to_sql import main
+            main()
+
+        assert exc_info.value.code == 1
+        assert MockClient.return_value.messages.create.call_count == 1
+
+    def test_max_retries_constant(self):
+        assert MAX_RETRIES == 3
