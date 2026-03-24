@@ -114,6 +114,12 @@ def _seed(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def explain_query(sql: str) -> None:
+    """Validate SQL via EXPLAIN QUERY PLAN without fetching rows. Raises on failure."""
+    conn = get_connection()
+    conn.execute(f"EXPLAIN QUERY PLAN {sql}")
+
+
 def run_query(sql: str) -> list[dict]:
     """Execute a SELECT query and return rows as a list of dicts."""
     conn = get_connection()
