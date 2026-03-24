@@ -88,3 +88,9 @@ Tables: `customers`, `orders`, `order_items`, `products`
 ```bash
 uv run python -m pytest tests/
 ```
+
+## Roadmap
+
+- **LangChain integration** — rewrite prompt construction using LangChain's built-in prompt templates (`ChatPromptTemplate`, `PromptTemplate`) and output parsers (`StrOutputParser`, `PydanticOutputParser`) to replace the current hand-rolled string formatting
+- **OpenAI model support** — add an `OPENAI_API_KEY` env var and swap in `ChatOpenAI` as an alternative LLM backend alongside the existing Anthropic/Claude backend, selectable via config
+- **Structured output parsing** — use LangChain parsers to return a typed object (SQL string + explanation + confidence) instead of raw text, making downstream validation cleaner
